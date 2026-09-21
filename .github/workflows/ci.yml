@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Lint, typecheck, tests, build
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: kinap
+          POSTGRES_PASSWORD: kinap_ci_only
+          POSTGRES_DB: kinap_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      NODE_ENV: test
+      APP_ENV: development
+      DATABASE_URL: postgresql://kinap:kinap_ci_only@localhost:5432/kinap_ci
+      DIRECT_DATABASE_URL: postgresql://kinap:kinap_ci_only@localhost:5432/kinap_ci
+      SESSION_SECRET: ci-only-session-secret-not-a-real-secret-00000000
+      OTP_PROVIDER: mock
+      APP_URL: http://localhost:3000
+      NEXT_PUBLIC_APP_URL: http://localhost:3000
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Prisma — generate client
+        run: npx prisma generate
+
+      - name: Prisma — validate schema
+        run: npx prisma validate
+
+      - name: Prisma — deploy migrations (si présentes)
+        run: |
+          if [ -d "./prisma/migrations" ] && [ "$(ls -A ./prisma/migrations 2>/dev/null)" ]; then
+            npx prisma migrate deploy
+          else
+            echo "Aucune migration versionnée pour l'instant (attendu en Phase 0) — étape ignorée."
+          fi
+
+      - name: Unit + integration tests
+        run: npm run test
+
+      - name: Build
+        run: npm run build
