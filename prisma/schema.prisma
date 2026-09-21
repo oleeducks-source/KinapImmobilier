@@ -1,0 +1,674 @@
+// Schéma Prisma — KINAP IMMOBILIER (Phase 0)
+//
+// Référence : "Décisions techniques verrouillées — KINAP IMMOBILIER (Phase 2.1)"
+// et "Architecture technique définitive — KINAP IMMOBILIER (Phase 2)".
+//
+// Invariants non négociables encodés ici :
+//  - Payment ≠ PaymentAllocation (un encaissement réel vs sa ventilation sur des échéances)
+//  - un seul Lease ACTIF par Unit à la fois
+//  - une seule CommissionRule ACTIVE à la fois pour tout le portefeuille (8 % par défaut)
+//  - Deposit (caution) toujours séparée de Payment
+//  - Payment, Deposit, CommissionTransaction, Disbursement : jamais de suppression physique
+//  - AuditLog : jamais purgé, jamais modifié
+//  - Owner : table à une seule ligne, non exposée en écran de gestion (affichage documentaire only)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Propriété (abstraction minimale, non multi-propriétaire — cf. Phase 1 §12)
+// ---------------------------------------------------------------------------
+
+model Owner {
+  id        String   @id @default(uuid())
+  name      String   @default("KINAP IMMOBILIER")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("owners")
+}
+
+// ---------------------------------------------------------------------------
+// Structure immobilière
+// ---------------------------------------------------------------------------
+
+model Property {
+  id        String   @id @default(uuid())
+  name      String
+  address   String?
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  buildings Building[]
+  expenses  Expense[]
+
+  @@index([name])
+  @@map("properties")
+}
+
+model Building {
+  id         String   @id @default(uuid())
+  propertyId String   @map("property_id")
+  name       String
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+  deletedAt  DateTime? @map("deleted_at")
+
+  property Property @relation(fields: [propertyId], references: [id])
+  floors   Floor[]
+
+  @@index([propertyId])
+  @@map("buildings")
+}
+
+model Floor {
+  id         String   @id @default(uuid())
+  buildingId String   @map("building_id")
+  label      String
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+  deletedAt  DateTime? @map("deleted_at")
+
+  building Building @relation(fields: [buildingId], references: [id])
+  units    Unit[]
+
+  @@index([buildingId])
+  @@map("floors")
+}
+
+enum UnitStatus {
+  VACANT
+  OCCUPIED
+}
+
+model Unit {
+  id            String     @id @default(uuid())
+  floorId       String     @map("floor_id")
+  code          String
+  type          String?
+  surfaceM2     Decimal?   @map("surface_m2") @db.Decimal(10, 2)
+  currentRent   Decimal    @map("current_rent") @db.Decimal(14, 2)
+  status        UnitStatus @default(VACANT)
+  createdAt     DateTime   @default(now()) @map("created_at")
+  updatedAt     DateTime   @updatedAt @map("updated_at")
+  deletedAt     DateTime?  @map("deleted_at")
+
+  floor  Floor   @relation(fields: [floorId], references: [id])
+  leases Lease[]
+
+  @@unique([floorId, code])
+  @@index([status])
+  @@map("units")
+}
+
+// ---------------------------------------------------------------------------
+// Locataires
+// ---------------------------------------------------------------------------
+
+model Tenant {
+  id          String   @id @default(uuid())
+  firstName   String   @map("first_name")
+  lastName    String   @map("last_name")
+  internalRef String   @unique @map("internal_ref") // jamais utilisé comme clé métier ailleurs que ce champ
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+  deletedAt   DateTime? @map("deleted_at")
+
+  contacts TenantContact[]
+  leases   Lease[]
+  payments Payment[]
+  documents Document[]
+
+  @@index([internalRef])
+  @@map("tenants")
+}
+
+model TenantContact {
+  id        String   @id @default(uuid())
+  tenantId  String   @map("tenant_id")
+  phone     String?
+  email     String?
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+  @@map("tenant_contacts")
+}
+
+// ---------------------------------------------------------------------------
+// Contrats
+// ---------------------------------------------------------------------------
+
+enum LeaseStatus {
+  ACTIVE
+  TERMINATED
+}
+
+model Lease {
+  id         String      @id @default(uuid())
+  unitId     String      @map("unit_id")
+  tenantId   String      @map("tenant_id")
+  rentAmount Decimal     @map("rent_amount") @db.Decimal(14, 2)
+  startDate  DateTime    @map("start_date") @db.Date
+  endDate    DateTime?   @map("end_date") @db.Date
+  status     LeaseStatus @default(ACTIVE)
+  createdAt  DateTime    @default(now()) @map("created_at")
+  updatedAt  DateTime    @updatedAt @map("updated_at")
+  deletedAt  DateTime?   @map("deleted_at")
+
+  unit          Unit           @relation(fields: [unitId], references: [id])
+  tenant        Tenant         @relation(fields: [tenantId], references: [id])
+  rentSchedules RentSchedule[]
+  deposits      Deposit[]
+  documents     Document[]
+
+  // NB Postgres : l'unicité "un seul Lease ACTIF par Unit" ne peut pas s'exprimer par un
+  // simple @@unique (elle est conditionnelle au statut ACTIVE). Elle est garantie par :
+  //   1) une contrainte d'exclusion Postgres ajoutée en migration SQL manuelle :
+  //      ALTER TABLE leases ADD CONSTRAINT one_active_lease_per_unit
+  //        EXCLUDE (unit_id WITH =) WHERE (status = 'ACTIVE');
+  //   2) une revalidation applicative dans LeaseService avant toute création (défense en profondeur).
+  @@index([unitId, status])
+  @@index([tenantId])
+  @@map("leases")
+}
+
+model RentSchedule {
+  id        String   @id @default(uuid())
+  leaseId   String   @map("lease_id")
+  period    DateTime @db.Date // premier jour du mois facturé
+  amountDue Decimal  @map("amount_due") @db.Decimal(14, 2)
+  dueDate   DateTime @map("due_date") @db.Date
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  lease       Lease                @relation(fields: [leaseId], references: [id])
+  allocations PaymentAllocation[]
+
+  @@unique([leaseId, period])
+  @@map("rent_schedules")
+}
+
+// ---------------------------------------------------------------------------
+// Encaissements — Payment ≠ PaymentAllocation (règle critique, Phase 2 §7.1)
+// ---------------------------------------------------------------------------
+
+enum PaymentStatus {
+  PENDING   // ex. chèque REÇU, pas encore ENCAISSÉ — n'alimente aucun calcul
+  VALIDATED
+  REJECTED
+  REVERSED  // contrepassé — jamais supprimé physiquement
+}
+
+model PaymentMethod {
+  id       String    @id @default(uuid())
+  label    String    @unique // especes | cheque | wave | orange_money | virement
+  payments Payment[]
+
+  @@map("payment_methods")
+}
+
+model Payment {
+  id          String        @id @default(uuid())
+  tenantId    String        @map("tenant_id")
+  leaseId     String        @map("lease_id")
+  methodId    String        @map("method_id")
+  amount      Decimal       @db.Decimal(14, 2) // > 0, validé en service, jamais côté client
+  date        DateTime      @db.Date
+  reference   String?
+  status      PaymentStatus @default(VALIDATED)
+  recordedBy  String        @map("recorded_by") // FK User, cf. plus bas
+  reversedAt  DateTime?     @map("reversed_at")
+  reversalReason String?    @map("reversal_reason")
+  createdAt   DateTime      @default(now()) @map("created_at")
+  updatedAt   DateTime      @updatedAt @map("updated_at")
+  deletedAt   DateTime?     @map("deleted_at") // soft delete seulement — jamais de suppression physique
+
+  tenant       Tenant               @relation(fields: [tenantId], references: [id])
+  method       PaymentMethod        @relation(fields: [methodId], references: [id])
+  recordedByUser User               @relation("PaymentRecordedBy", fields: [recordedBy], references: [id])
+  allocations  PaymentAllocation[]
+  commission   CommissionTransaction?
+  cheque       Cheque?
+
+  @@index([tenantId, date])
+  @@index([leaseId])
+  @@map("payments")
+}
+
+// Un chèque REÇU n'alimente pas les fonds disponibles ; seul ENCAISSÉ le fait (Phase 2 §7.3)
+enum ChequeStatus {
+  RECU
+  ENCAISSE
+  REJETE
+  ANNULE
+}
+
+model Cheque {
+  id         String       @id @default(uuid())
+  paymentId  String       @unique @map("payment_id")
+  status     ChequeStatus @default(RECU)
+  bankName   String?      @map("bank_name")
+  chequeNumber String?    @map("cheque_number")
+  encashedAt DateTime?    @map("encashed_at")
+  createdAt  DateTime     @default(now()) @map("created_at")
+  updatedAt  DateTime     @updatedAt @map("updated_at")
+
+  payment Payment @relation(fields: [paymentId], references: [id])
+
+  @@map("cheques")
+}
+
+model PaymentAllocation {
+  id             String   @id @default(uuid())
+  paymentId      String   @map("payment_id")
+  rentScheduleId String   @map("rent_schedule_id")
+  amount         Decimal  @db.Decimal(14, 2)
+  createdAt      DateTime @default(now()) @map("created_at")
+  deletedAt      DateTime? @map("deleted_at")
+
+  payment      Payment      @relation(fields: [paymentId], references: [id])
+  rentSchedule RentSchedule @relation(fields: [rentScheduleId], references: [id])
+
+  // Invariant Σ(allocations.amount) ≤ payment.amount vérifié dans PaymentService,
+  // dans la même transaction que la création — jamais laissé au seul niveau applicatif isolé.
+  @@index([paymentId])
+  @@index([rentScheduleId])
+  @@map("payment_allocations")
+}
+
+// ---------------------------------------------------------------------------
+// Cautions — toujours séparées des loyers, jamais commissionnées par défaut
+// ---------------------------------------------------------------------------
+
+enum DepositStatus {
+  HELD
+  RETURNED
+  WITHHELD
+}
+
+model Deposit {
+  id               String        @id @default(uuid())
+  leaseId          String        @map("lease_id")
+  amount           Decimal       @db.Decimal(14, 2)
+  receivedDate     DateTime      @map("received_date") @db.Date
+  mode             String?
+  status           DepositStatus @default(HELD)
+  returnedDate     DateTime?     @map("returned_date") @db.Date
+  returnedAmount   Decimal?      @map("returned_amount") @db.Decimal(14, 2)
+  withholdingReason String?      @map("withholding_reason")
+  createdAt        DateTime      @default(now()) @map("created_at")
+  updatedAt        DateTime      @updatedAt @map("updated_at")
+  deletedAt        DateTime?     @map("deleted_at") // soft delete seulement
+
+  lease Lease @relation(fields: [leaseId], references: [id])
+
+  @@index([leaseId])
+  @@map("deposits")
+}
+
+// ---------------------------------------------------------------------------
+// Commission KINAP — une seule règle ACTIVE à la fois, 8 % par défaut
+// ---------------------------------------------------------------------------
+
+enum CommissionRuleStatus {
+  ACTIVE
+  INACTIVE
+}
+
+model CommissionRule {
+  id               String                @id @default(uuid())
+  rate             Decimal               @db.Decimal(5, 4) // ex. 0.0800 = 8 %
+  appliesToDeposit Boolean               @default(false) @map("applies_to_deposit")
+  startDate        DateTime              @map("start_date") @db.Date
+  endDate          DateTime?             @map("end_date") @db.Date
+  status           CommissionRuleStatus  @default(ACTIVE)
+  createdAt        DateTime              @default(now()) @map("created_at")
+  updatedAt        DateTime              @updatedAt @map("updated_at")
+
+  transactions CommissionTransaction[]
+
+  // Invariant "une seule règle ACTIVE à la fois" vérifié dans CommissionService
+  // (transaction : désactiver l'ancienne + activer la nouvelle, jamais deux ACTIVE simultanées).
+  @@index([status, startDate])
+  @@map("commission_rules")
+}
+
+model CommissionTransaction {
+  id        String   @id @default(uuid())
+  paymentId String   @unique @map("payment_id")
+  ruleId    String   @map("rule_id")
+  amount    Decimal  @db.Decimal(14, 2)
+  createdAt DateTime @default(now()) @map("created_at")
+  deletedAt DateTime? @map("deleted_at") // soft delete seulement — jamais de suppression physique
+
+  payment Payment        @relation(fields: [paymentId], references: [id])
+  rule    CommissionRule @relation(fields: [ruleId], references: [id])
+
+  @@index([paymentId])
+  @@map("commission_transactions")
+}
+
+// ---------------------------------------------------------------------------
+// Impayés / recouvrement (dérivés, jamais saisis manuellement)
+// ---------------------------------------------------------------------------
+
+model Arrears {
+  id        String   @id @default(uuid())
+  leaseId   String   @map("lease_id")
+  period    DateTime @db.Date
+  amount    Decimal  @db.Decimal(14, 2)
+  severity  String?  // recalculé, non saisi
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  collectionActions CollectionAction[]
+
+  @@unique([leaseId, period])
+  @@map("arrears")
+}
+
+enum CollectionActionType {
+  RELANCE
+  MISE_EN_DEMEURE
+  DOSSIER_HUISSIER
+}
+
+model CollectionAction {
+  id        String                @id @default(uuid())
+  arrearsId String                @map("arrears_id")
+  date      DateTime              @db.Date
+  type      CollectionActionType
+  result    String?
+  createdAt DateTime              @default(now()) @map("created_at")
+  updatedAt DateTime              @updatedAt @map("updated_at")
+  deletedAt DateTime?             @map("deleted_at")
+
+  arrears Arrears @relation(fields: [arrearsId], references: [id])
+
+  @@index([arrearsId, date])
+  @@map("collection_actions")
+}
+
+// ---------------------------------------------------------------------------
+// Relevés de période et décaissements (Décision #7, Phase 2.1)
+// ---------------------------------------------------------------------------
+
+enum PeriodStatementStatus {
+  OUVERTE
+  CALCULEE
+  CLOTUREE
+  REOUVERTE
+}
+
+model PeriodStatement {
+  id              String                 @id @default(uuid())
+  period          DateTime               @unique @db.Date
+  totalDue        Decimal?               @map("total_due") @db.Decimal(14, 2)
+  totalCollected  Decimal?               @map("total_collected") @db.Decimal(14, 2)
+  commissionKinap Decimal?               @map("commission_kinap") @db.Decimal(14, 2)
+  otherDeductions Decimal?               @map("other_deductions") @db.Decimal(14, 2)
+  netAvailable    Decimal?               @map("net_available") @db.Decimal(14, 2)
+  adjustments     Json?                  // liste de {date, motif, montant, reference, userId} — jamais réécrit, toujours ajouté
+  status          PeriodStatementStatus  @default(OUVERTE)
+  closedAt        DateTime?              @map("closed_at")
+  closedBy        String?                @map("closed_by")
+  createdAt       DateTime               @default(now()) @map("created_at")
+  updatedAt       DateTime               @updatedAt @map("updated_at")
+
+  disbursements Disbursement[]
+
+  @@map("period_statements")
+}
+
+enum DisbursementStatus {
+  PENDING    // créé par GESTIONNAIRE — pas encore validé
+  VALIDATED  // validé par COMPTABLE/ADMIN/SUPER ADMIN — règle des quatre yeux
+  REJECTED
+}
+
+model Disbursement {
+  id                String              @id @default(uuid())
+  periodStatementId String?             @map("period_statement_id")
+  beneficiary       String
+  amount            Decimal             @db.Decimal(14, 2)
+  date              DateTime            @db.Date
+  reason            String
+  reference         String?
+  justificatifDocId String?             @map("justificatif_doc_id")
+  status            DisbursementStatus  @default(PENDING)
+  createdBy         String              @map("created_by")
+  validatedBy       String?             @map("validated_by")
+  validatedAt       DateTime?           @map("validated_at")
+  createdAt         DateTime            @default(now()) @map("created_at")
+  updatedAt         DateTime            @updatedAt @map("updated_at")
+  deletedAt         DateTime?           @map("deleted_at") // soft delete seulement
+
+  periodStatement PeriodStatement? @relation(fields: [periodStatementId], references: [id])
+  createdByUser   User             @relation("DisbursementCreatedBy", fields: [createdBy], references: [id])
+  validatedByUser User?            @relation("DisbursementValidatedBy", fields: [validatedBy], references: [id])
+
+  // Règle des quatre yeux (Phase 2.1 §6) vérifiée en service : createdBy != validatedBy obligatoire.
+  @@index([date])
+  @@index([status])
+  @@map("disbursements")
+}
+
+model Expense {
+  id         String   @id @default(uuid())
+  propertyId String   @map("property_id")
+  amount     Decimal  @db.Decimal(14, 2)
+  category   String
+  date       DateTime @db.Date
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+  deletedAt  DateTime? @map("deleted_at")
+
+  property Property @relation(fields: [propertyId], references: [id])
+
+  @@index([propertyId, date])
+  @@map("expenses")
+}
+
+// ---------------------------------------------------------------------------
+// Documents (métadonnées seulement — fichier réel en Object Storage S3-compatible)
+// ---------------------------------------------------------------------------
+
+enum DocumentEntityType {
+  TENANT
+  LEASE
+  UNIT
+}
+
+model Document {
+  id             String              @id @default(uuid())
+  entityType     DocumentEntityType  @map("entity_type")
+  tenantId       String?             @map("tenant_id")
+  leaseId        String?             @map("lease_id")
+  unitId         String?             @map("unit_id")
+  type           String              // piece_identite | contrat | quittance | justificatif | financier | autre
+  storageKey     String              @map("storage_key") // identifiant interne non prévisible, jamais le nom original
+  originalName   String              @map("original_name")
+  mimeType       String              @map("mime_type")
+  sizeBytes      Int                 @map("size_bytes")
+  sha256         String
+  createdAt      DateTime            @default(now()) @map("created_at")
+  updatedAt      DateTime            @updatedAt @map("updated_at")
+  deletedAt      DateTime?           @map("deleted_at")
+
+  tenant Tenant? @relation(fields: [tenantId], references: [id])
+  lease  Lease?  @relation(fields: [leaseId], references: [id])
+  unit   Unit?   @relation(fields: [unitId], references: [id])
+
+  @@index([entityType, tenantId])
+  @@index([entityType, leaseId])
+  @@index([entityType, unitId])
+  @@map("documents")
+}
+
+// ---------------------------------------------------------------------------
+// Sécurité — User / Role / Permission
+// ---------------------------------------------------------------------------
+
+enum RoleName {
+  SUPER_ADMIN
+  ADMIN
+  GESTIONNAIRE
+  COMPTABLE
+  AGENT_RECOUVREMENT
+  LECTEUR
+}
+
+model Role {
+  id   String   @id @default(uuid())
+  name RoleName @unique
+
+  users       User[]
+  permissions Permission[]
+
+  @@map("roles")
+}
+
+enum PermissionAction {
+  VIEW
+  CREATE
+  UPDATE
+  DELETE_SOFT
+  VALIDATE
+  REVERSE
+  EXPORT
+}
+
+model Permission {
+  id     String            @id @default(uuid())
+  roleId String            @map("role_id")
+  module String            // ex. "payments", "disbursements" — voir src/server/permissions/matrix.ts
+  action PermissionAction
+
+  role Role @relation(fields: [roleId], references: [id])
+
+  @@unique([roleId, module, action])
+  @@index([roleId, module])
+  @@map("permissions")
+}
+
+enum UserStatus {
+  ACTIVE
+  DISABLED
+}
+
+model User {
+  id           String     @id @default(uuid())
+  email        String     @unique
+  passwordHash String     @map("password_hash") // Argon2id — jamais en clair, jamais loggé
+  phone        String?    // requis pour l'envoi OTP (SMS) quand otpRequired=true ; optionnel sinon
+  roleId       String     @map("role_id")
+  status       UserStatus @default(ACTIVE)
+  otpRequired  Boolean    @default(false) @map("otp_required")
+  createdAt    DateTime   @default(now()) @map("created_at")
+  updatedAt    DateTime   @updatedAt @map("updated_at")
+  deletedAt    DateTime?  @map("deleted_at")
+
+  role                Role                @relation(fields: [roleId], references: [id])
+  sessions            Session[]
+  otpCodes            OtpCode[]
+  auditLogs           AuditLog[]
+  paymentsRecorded    Payment[]           @relation("PaymentRecordedBy")
+  disbursementsCreated   Disbursement[]   @relation("DisbursementCreatedBy")
+  disbursementsValidated Disbursement[]   @relation("DisbursementValidatedBy")
+  notifications       Notification[]
+
+  @@map("users")
+}
+
+model Session {
+  id        String   @id @default(uuid())
+  userId    String   @map("user_id")
+  tokenHash String   @unique @map("token_hash") // le token brut n'est jamais stocké, seulement son hash
+  ipAddress String?  @map("ip_address")
+  userAgent String?  @map("user_agent")
+  expiresAt DateTime @map("expires_at")
+  revokedAt DateTime? @map("revoked_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+enum OtpPurpose {
+  LOGIN
+  PASSWORD_RESET
+}
+
+model OtpCode {
+  id          String     @id @default(uuid())
+  userId      String     @map("user_id")
+  purpose     OtpPurpose
+  codeHash    String     @map("code_hash") // jamais le code en clair, jamais loggé
+  expiresAt   DateTime   @map("expires_at")
+  consumedAt  DateTime?  @map("consumed_at")
+  attempts    Int        @default(0)
+  maxAttempts Int        @default(3) @map("max_attempts")
+  createdAt   DateTime   @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId, purpose])
+  @@map("otp_codes")
+}
+
+// ---------------------------------------------------------------------------
+// Audit — jamais purgé, jamais modifié
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id            String   @id @default(uuid())
+  userId        String?  @map("user_id") // nullable pour les actions système automatisées
+  action        String
+  entityType    String   @map("entity_type")
+  entityId      String?  @map("entity_id")
+  oldValue      Json?    @map("old_value")
+  newValue      Json?    @map("new_value")
+  reason        String?
+  result        String   @default("success") // success | failure
+  ipAddress     String?  @map("ip_address")
+  userAgent     String?  @map("user_agent")
+  correlationId String?  @map("correlation_id")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  user User? @relation(fields: [userId], references: [id])
+
+  // Aucun champ deletedAt : cette table n'est jamais soft-deletable ni purgeable par l'application.
+  @@index([entityType, entityId, createdAt])
+  @@index([userId, createdAt])
+  @@index([correlationId])
+  @@map("audit_logs")
+}
+
+model Notification {
+  id          String   @id @default(uuid())
+  recipientId String   @map("recipient_id")
+  type        String
+  channel     String   // in_app | email | sms
+  status      String   @default("unread")
+  createdAt   DateTime @default(now()) @map("created_at")
+  readAt      DateTime? @map("read_at")
+
+  recipient User @relation(fields: [recipientId], references: [id])
+
+  @@index([recipientId, status])
+  @@map("notifications")
+}
