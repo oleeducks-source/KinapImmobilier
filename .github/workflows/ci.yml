@@ -51,12 +51,6 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Lint
-        run: npm run lint
-
-      - name: Typecheck
-        run: npm run typecheck
-
       - name: Prisma — generate client
         run: npx prisma generate
 
@@ -71,8 +65,36 @@ jobs:
             echo "Aucune migration versionnée pour l'instant (attendu en Phase 0) — étape ignorée."
           fi
 
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
       - name: Unit + integration tests
         run: npm run test
 
       - name: Build
         run: npm run build
+
+  deploy-staging:
+    name: Deploy to Staging
+    needs: quality
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy (Railway — staging)
+        run: echo "Déploiement Staging déclenché ici (commande Railway CLI réelle à brancher)."
+
+  deploy-production:
+    name: Deploy to Production
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy (Railway — production)
+        run: echo "Déploiement Production déclenché ici (commande Railway CLI réelle à brancher)."
