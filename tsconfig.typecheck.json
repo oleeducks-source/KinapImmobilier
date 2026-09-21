@@ -1,0 +1,9 @@
+{
+  // Utilisé par `npm run typecheck` (tsc --noEmit) pour vérifier TOUT le
+  // dépôt — y compris prisma/seed.ts et tests/**/*.test.ts — contrairement
+  // à tsconfig.json (utilisé par `next build`) qui les exclut volontairement
+  // pour ne pas casser le build applicatif avec des types hors bundle.
+  "extends": "./tsconfig.json",
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
+  "exclude": ["node_modules"]
+}

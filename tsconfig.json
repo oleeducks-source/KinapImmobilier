@@ -1,0 +1,31 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["dom", "dom.iterable", "esnext"],
+    "allowJs": false,
+    "skipLibCheck": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "forceConsistentCasingInFileNames": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "preserve",
+    "incremental": true,
+    "plugins": [{ "name": "next" }],
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  },
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
+  // "prisma" et "tests" sont exclus ICI car `next build` type-vérifie tout ce
+  // que ce tsconfig inclut (pas seulement ce que l'app importe réellement) —
+  // prisma/seed.ts et tests/**/*.test.ts cassaient donc le build en tirant
+  // des types Prisma non pertinents pour le bundle applicatif. Le script
+  // `npm run typecheck` couvre ces dossiers séparément via
+  // tsconfig.typecheck.json (voir ce fichier), qui les réintègre.
+  "exclude": ["node_modules", "prisma", "tests"]
+}
